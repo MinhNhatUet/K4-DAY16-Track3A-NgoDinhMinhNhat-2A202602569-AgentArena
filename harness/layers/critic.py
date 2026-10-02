@@ -70,7 +70,23 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+from arena.model import MockModel
+
+from harness.agent import REAL_MODEL_PROMPT_ADDENDUM, real_model_system_prompt
+from harness.layers.citation_checker import _norm, in_one_line
 from harness.middleware import Middleware
+
+#: = arena.scorer.MAX_CLAIMS_PER_DOC / MAX_SCORED_CLAIMS: claim vượt trần bị
+#: chấm REDUNDANT / EXCESS, phạt như một claim bịa.
+MAX_CLAIMS_PER_DOC = 4
+MAX_CLAIMS = 10
+
+
+def _model_is_mock(model) -> bool:
+    # Runner bọc model (ProvenanceModel.inner); bóc ra để xem lõi.
+    while model is not None and not isinstance(model, MockModel):
+        model = getattr(model, "inner", None)
+    return model is not None
 
 
 class Critic(Middleware):
@@ -78,16 +94,32 @@ class Critic(Middleware):
 
     name = "critic"
 
+    def before_model(self, ctx, messages):
+        # agent.py: phụ lục này là thứ "the SCORED, REAL-MODEL path must
+        # pass", nhưng runner mặc định gửi ARENA_SYSTEM_PROMPT trơn. Nó dạy
+        # model tìm trước khi abstain, trích nguyên văn và điền `verdict`.
+        # MockModel bỏ qua prompt, gắn vào chỉ tốn token.
+        if not messages or messages[0].get("role") != "system" or _model_is_mock(ctx.model):
+            return messages
+        system = messages[0].get("content") or ""
+        if REAL_MODEL_PROMPT_ADDENDUM.strip() in system:
+            return messages
+        return [{**messages[0], "content": real_model_system_prompt(system)}, *messages[1:]]
+
     def after_agent(self, ctx, report):
         claims = report.get("claims")
         if not isinstance(claims, list) or not claims:
             return report
-        observed = ctx.observed_text
-        # Tool wrappers and joins between lines are not document quotations.
-        evidence_lines = (
-            [line for doc in ctx.corpus.docs for line in doc.body.splitlines()]
-            if ctx.corpus is not None else observed.splitlines()
-        )
+        observed = _norm(ctx.observed_text)
+        docs = ctx.corpus.docs if ctx.corpus is not None else []
+
+        def supported(text):
+            # So sau chuẩn hoá như scorer: model thật đổi hoa/thường, khoảng
+            # trắng; so từng ký tự thì xoá nhầm claim đúng.
+            if _norm(text) not in observed:
+                return False
+            return ctx.corpus is None or any(in_one_line(text, doc) for doc in docs)
+
         kept = []
         for claim in claims:
             if not isinstance(claim, dict):
@@ -95,7 +127,7 @@ class Critic(Middleware):
             text = claim.get("text")
             if not isinstance(text, str) or not text:
                 continue
-            if text in observed and any(text in line for line in evidence_lines):
+            if supported(text):
                 kept.append(claim)
                 continue
             # Only slice the model's own text; never reconstruct it from a document.
@@ -103,12 +135,11 @@ class Critic(Middleware):
                 if not text.startswith(" và ", index):
                     continue
                 parts = (text[:index], text[index + len(" và "):])
-                if not all(part and part in observed for part in parts) or ctx.corpus is None:
+                if not all(part and supported(part) for part in parts) or ctx.corpus is None:
                     continue
                 sources = [
-                    [doc for doc in ctx.corpus.docs
-                     if doc.body in observed
-                     and any(part in line for line in doc.body.splitlines())]
+                    [doc for doc in docs
+                     if doc.body in ctx.observed_text and in_one_line(part, doc)]
                     for part in parts
                 ]
                 pair = next(((a, b) for a in sources[0] for b in sources[1]
@@ -118,6 +149,14 @@ class Critic(Middleware):
                                 for part, doc in zip(parts, pair))
                     report["abstain"] = True
                     break
+        per_doc: dict = {}
+        within = []
+        for claim in kept:
+            key = str(claim.get("doc_id")).strip()
+            per_doc[key] = per_doc.get(key, 0) + 1
+            if per_doc[key] <= MAX_CLAIMS_PER_DOC:
+                within.append(claim)
+        kept = within[:MAX_CLAIMS]
         report["claims"] = kept
         report["citations"] = sorted({
             c["doc_id"] for c in kept if isinstance(c.get("doc_id"), str)

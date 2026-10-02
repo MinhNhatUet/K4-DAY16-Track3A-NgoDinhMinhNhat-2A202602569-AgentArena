@@ -74,9 +74,22 @@ MAX_LINE_CHARS = 500
 MIN_MISSING_CHARS = 20
 
 
+#: = arena.scorer.MIN_SUPPORT_CHARS.
+MIN_QUOTE_CHARS = 12
+
+
 def _norm(text: str) -> str:
     # Cùng dạng so sánh với arena.scorer._norm: model thật hay viết thường.
     return re.sub(r"\s+", " ", unicodedata.normalize("NFC", text).casefold()).strip()
+
+
+def in_one_line(text: str, doc) -> bool:
+    """Luật SUPPORTED của scorer: `text` (đã chuẩn hoá, 12-500 ký tự) nằm
+    gọn trong một dòng của `doc`. Chỉ để so khớp, không ghi vào claim."""
+    t = _norm(text)
+    if not MIN_QUOTE_CHARS <= len(t) <= MAX_LINE_CHARS:
+        return False
+    return any(t in _norm(line) for line in doc.body.splitlines())
 
 #: = arena.runner.MAX_SEARCH_K; xin nhiều hơn thì runner cũng kẹp về 10.
 SEARCH_K = 10
@@ -192,11 +205,11 @@ class CitationChecker(Middleware):
             if not isinstance(text, str) or not text:
                 continue
             doc_id = claim.get("doc_id")
-            doc = ctx.corpus.get(doc_id) if isinstance(doc_id, str) else None
-            if doc is not None and any(text in line for line in doc.body.splitlines()):
+            doc = ctx.corpus.get(doc_id.strip()) if isinstance(doc_id, str) else None
+            if doc is not None and in_one_line(text, doc):
                 continue
             for doc in ctx.corpus.docs:
-                if doc.body in observed and any(text in line for line in doc.body.splitlines()):
+                if doc.body in observed and in_one_line(text, doc):
                     claim["doc_id"] = doc.doc_id
                     break
         report["citations"] = sorted({

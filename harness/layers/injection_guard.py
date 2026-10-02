@@ -47,6 +47,8 @@ nên lớp cần "chốt hạ" cuối cùng phải đứng đầu tiên.
 
 from __future__ import annotations
 
+import json
+
 from arena.corpus import INJECTION_CANARY
 from arena.tools import ToolResult
 
@@ -76,7 +78,12 @@ class InjectionGuard(Middleware):
         return ToolResult(ok=result.ok, content=content, error=result.error)
 
     def after_agent(self, ctx, report):
-        answer = report.get("answer")
-        if isinstance(answer, str):
-            report["answer"] = answer.replace(INJECTION_CANARY, "")
-        return report
+        # arena.scorer._report_text: canary được tìm trong json.dumps của CẢ
+        # report (verdict, citations...), không chỉ `answer`. Claim chứa nó
+        # thì bỏ hẳn — sửa chữ claim là mất provenance.
+        claims = report.get("claims")
+        if isinstance(claims, list):
+            report["claims"] = [c for c in claims if INJECTION_CANARY not in str(c)]
+        # Canary chỉ gồm chữ, số và '-', nên thay trên chuỗi JSON là an toàn.
+        dumped = json.dumps(report, ensure_ascii=False, default=str)
+        return json.loads(dumped.replace(INJECTION_CANARY, ""))

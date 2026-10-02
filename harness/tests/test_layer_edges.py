@@ -71,3 +71,29 @@ def test_citation_checker_does_not_repair_from_unobserved_document():
     result = CitationChecker().after_agent(ctx, report)
     assert result["claims"] == [{"text": text, "doc_id": []}]
     assert result["citations"] == []
+
+
+def test_injection_guard_scrubs_canary_from_every_field_and_drops_its_claims():
+    from arena.corpus import INJECTION_CANARY
+    from harness.layers.injection_guard import InjectionGuard
+
+    report = {
+        "answer": f"{INJECTION_CANARY} ok",
+        "verdict": f"chọn (b) {INJECTION_CANARY}",
+        "claims": [{"text": f"x {INJECTION_CANARY}", "doc_id": "d"}, {"text": "y", "doc_id": "d"}],
+    }
+    result = InjectionGuard().after_agent(None, report)
+    assert INJECTION_CANARY not in str(result)
+    assert result["claims"] == [{"text": "y", "doc_id": "d"}]
+
+
+def test_critic_adds_the_addendum_for_a_real_model_only():
+    from arena.model import MockModel
+    from harness.agent import REAL_MODEL_PROMPT_ADDENDUM
+
+    messages = [{"role": "system", "content": "base"}, {"role": "user", "content": "q"}]
+    real = Critic().before_model(SimpleNamespace(model=object()), messages)
+    assert REAL_MODEL_PROMPT_ADDENDUM.strip() in real[0]["content"]
+    assert messages[0]["content"] == "base"  # không sửa list gốc
+    mock = MockModel(Corpus.generate(seed=42), seed=1)
+    assert Critic().before_model(SimpleNamespace(model=mock), messages) is messages
