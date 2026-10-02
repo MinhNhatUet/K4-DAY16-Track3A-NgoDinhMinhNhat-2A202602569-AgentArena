@@ -59,7 +59,38 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+import json
+import re
+import unicodedata
+
+from arena.model import parse_output
+
 from harness.middleware import Middleware
+
+#: = arena.scorer.MAX_CLAIM_CHARS; dài hơn là OVERLONG, đừng đòi.
+MAX_LINE_CHARS = 500
+
+#: Phần đuôi bị bỏ phải đủ dài mới đáng tốn một lượt gọi model.
+MIN_MISSING_CHARS = 20
+
+
+def _norm(text: str) -> str:
+    # Cùng dạng so sánh với arena.scorer._norm: model thật hay viết thường.
+    return re.sub(r"\s+", " ", unicodedata.normalize("NFC", text).casefold()).strip()
+
+#: = arena.runner.MAX_SEARCH_K; xin nhiều hơn thì runner cũng kẹp về 10.
+SEARCH_K = 10
+
+#: Model thật hay trích nửa dòng, rơi mất key term ở nửa sau (đo trên
+#: pub-08 với gemini: claim ĐÚNG nhưng thiếu "tối đa là 10%" -> recall 0).
+#: Layer không được nối chữ vào claim, nên chỉ có thể nhắc trước khi FINAL.
+#: Không chứa doc_id hay FINALIZE_SENTINEL để MockModel bỏ qua nó.
+QUOTE_REMINDER = (
+    "Chỉ áp dụng KHI bạn viết FINAL (chưa đủ bằng chứng thì cứ tiếp tục "
+    "search/fetch_doc): mỗi claim phải là TOÀN BỘ một dòng chép nguyên văn "
+    "từ tài liệu đã đọc, từ đầu đến cuối dòng, không cắt bớt, không sửa "
+    "chữ hay dấu câu; doc_id là tài liệu chứa đúng dòng đó."
+)
 
 
 class CitationChecker(Middleware):
@@ -67,17 +98,109 @@ class CitationChecker(Middleware):
 
     name = "citation_checker"
 
+    def wrap_tool_call(self, ctx, call, name, args):
+        if name == "search" and isinstance(args, dict):
+            # Model thật đặt truy vấn ngắn; tài liệu đúng hay rơi ở hạng 6-8
+            # (pub-08: "an toàn lao động" -> doc-0017 hạng 6). Lấy tới trần
+            # của runner; scorer không phạt độ rộng, chỉ phạt token.
+            args = {**args, "k": SEARCH_K}
+        result = call(name, args)
+        if name == "fetch_doc" and result.ok:
+            ctx.state["citation_fetched"] = True
+        return result
+
+    def before_model(self, ctx, messages):
+        # Chỉ khi đã có tài liệu trong tay: nhắc sớm hơn làm model thật chốt
+        # FINAL ngay sau search (đo được: abstain, S 30 -> 20). Một fetch đã
+        # xảy ra cũng bảo đảm có lượt assistant, nên MockModel không nhầm
+        # lời nhắc là câu hỏi của brief.
+        if ctx.state.get("citation_fetched"):
+            return messages + [{"role": "user", "content": QUOTE_REMINDER}]
+        return messages
+
+    def wrap_model_call(self, ctx, call, messages):
+        # Lời nhắc chung chưa đủ: gemini vẫn dừng ở dấu chấm đầu tiên của một
+        # dòng hai câu, rơi key term ở câu sau (pub-08, 2/2 lượt). Scorer gộp
+        # mọi FINAL đã ghi trace để xét provenance, nên hỏi lại MỘT lần là
+        # hợp lệ: chữ trong claim vẫn do model tự viết.
+        response = call(messages)
+        if ctx.state.get("citation_reasked") or ctx.corpus is None:
+            return response
+        lines = self._partial_quotes(ctx, response.text)
+        if not lines:
+            return response
+        ctx.state["citation_reasked"] = True
+        # Đưa sẵn object JSON: chỉ nói "chép cả dòng" thì gemini vẫn tách
+        # một dòng hai câu thành hai claim (pub-02), mỗi claim thiếu key term.
+        feedback = (
+            "FINAL của bạn chỉ chép MỘT PHẦN dòng tài liệu, nên thiếu dữ kiện. "
+            "Viết lại FINAL, giữ nguyên định dạng. Mỗi dòng dưới đây phải là "
+            "MỘT claim DUY NHẤT chứa NGUYÊN CẢ DÒNG — không tách theo câu, "
+            "không cắt bớt. Thay các claim chỉ chép một phần dòng bằng đúng "
+            "các claim sau:\n"
+            + "\n".join(
+                json.dumps({"text": line, "doc_id": doc_id}, ensure_ascii=False)
+                for doc_id, line in lines
+            )
+        )
+        return call(messages + [
+            {"role": "assistant", "content": response.text},
+            {"role": "user", "content": feedback},
+        ])
+
+    @staticmethod
+    def _partial_quotes(ctx, text):
+        """(doc_id, dòng đầy đủ) cho mỗi claim chỉ là một khúc của dòng đó."""
+        from harness.agent import _canonicalise  # agent không import layers
+
+        parsed = parse_output(_canonicalise(text))
+        final = parsed.final if parsed.kind == "final" else None
+        claims = final.get("claims") if isinstance(final, dict) else None
+        if not isinstance(claims, list):
+            return []
+        observed = ctx.observed_text
+        read = [d for d in ctx.corpus.docs if d.body in observed]
+        found = []
+        for claim in claims:
+            quote = _norm(claim.get("text", "")) if isinstance(claim, dict) else ""
+            if not quote or any(
+                quote == _norm(l) for d in read for l in d.body.splitlines()
+            ):
+                continue
+            for doc in read:
+                line = next((
+                    l.strip() for l in doc.body.splitlines()
+                    if quote in _norm(l)
+                    and len(_norm(l)) - len(quote) >= MIN_MISSING_CHARS
+                    and len(l.strip()) <= MAX_LINE_CHARS
+                ), None)
+                if line is not None:
+                    if (doc.doc_id, line) not in found:
+                        found.append((doc.doc_id, line))
+                    break
+        return found
+
     def after_agent(self, ctx, report):
-        # TODO (§11): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; bỏ qua nếu rỗng hoặc ctx.corpus là None.
-        #  2. Với mỗi claim, gọi ctx.corpus.get(claim["doc_id"]).
-        #     Nếu tài liệu tồn tại VÀ claim["text"] khớp NGUYÊN VĂN một
-        #     DÒNG trong body của nó (không phải chỉ "nằm trong body")
-        #     -> trích dẫn đã đúng, giữ nguyên claim.
-        #  3. Nếu không: tìm trong ctx.corpus.docs tài liệu đầu tiên thoả
-        #     doc.body in ctx.observed_text  và  claim["text"] khớp
-        #     nguyên văn một DÒNG của doc.body -> đó là nguồn thật.
-        #     Đổi doc_id sang nó, GIỮ NGUYÊN text.
-        #  4. Không tìm được nguồn nào -> để `critic` xử lý, đừng bịa doc_id.
-        #  5. Cập nhật report["citations"] = danh sách doc_id đã sắp xếp.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims or ctx.corpus is None:
+            return report
+        observed = ctx.observed_text
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            text = claim.get("text")
+            if not isinstance(text, str) or not text:
+                continue
+            doc_id = claim.get("doc_id")
+            doc = ctx.corpus.get(doc_id) if isinstance(doc_id, str) else None
+            if doc is not None and any(text in line for line in doc.body.splitlines()):
+                continue
+            for doc in ctx.corpus.docs:
+                if doc.body in observed and any(text in line for line in doc.body.splitlines()):
+                    claim["doc_id"] = doc.doc_id
+                    break
+        report["citations"] = sorted({
+            c["doc_id"] for c in claims
+            if isinstance(c, dict) and isinstance(c.get("doc_id"), str)
+        })
+        return report
